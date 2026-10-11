@@ -39,5 +39,23 @@ uv run --extra pdf --extra graph python -m paper_import_mcp.server --transport s
 `paper_ids` 指已有的 `data/workspace/papers/<paper_id>/source.pdf`。
 远程客户端上传 PDF 需要后续补独立上传入口；不要将大 PDF 编成 base64 作为工具参数。
 
-旧 FastAPI 服务仍保留原代码。若两者同时运行，可能由任一服务的 worker 接手
-`jobs.sqlite` 中的任务；验证新 MCP 流水线时，建议停止旧 backend 服务。
+## 使用 Prompt 示例
+
+在客户端连接并命名此 MCP 为 `paper2graph` 后，可以向智能体发送：
+
+```text
+请使用 paper2graph MCP，导入 XX 目录下的所有 PDF 论文，task_root_id 为 XXX。
+请向我汇报导入进度，监督直到全部完成。
+```
+
+例如，将目录替换为实际的绝对路径：
+
+```text
+请使用 paper2graph MCP，导入 /absolute/path/to/papers 目录下的所有 PDF 论文，task_root_id 为 medical_report_generation。
+请向我汇报导入进度，监督直到全部完成，最后总结成功、失败的论文及失败原因。
+```
+
+目录必须位于 MCP 服务所在机器上，且智能体需要能列出其中的 PDF 文件。
+智能体应先枚举文件，将具体路径通过 `pdf_paths` 提交给 `create_paper_import_batch`，
+再使用 `get_paper_import_batch` 持续查询并汇报进度。收到 `batch_id` 只表示入队，
+不代表导入完成；应等所有论文进入成功或失败的终态后汇总结果。
