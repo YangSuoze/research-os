@@ -16,11 +16,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from paper_import_mcp.config import settings
 from paper_import_mcp.db.paper_imports import PaperImportRepository
+from paper_import_mcp.infra.elasticsearch import ElasticsearchPaperStore
 from paper_import_mcp.infra.neo4j import GraphStore
 from paper_import_mcp.models.paper_import import BatchAccepted, BatchOut
 from paper_import_mcp.services.batches import PaperImportBatches
 from paper_import_mcp.services.graph_query import GraphQueryService
+from paper_import_mcp.services.paper_context import PaperContextService
 from paper_import_mcp.services.paper_import import PaperImportService
+from paper_import_mcp.web.paper_viewer import paper_pdf, paper_viewer
 from paper_import_mcp.workers.paper_import import PaperImportWorker
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,7 @@ logger = logging.getLogger(__name__)
 class AppContext:
     batches: PaperImportBatches
     graph: GraphQueryService
+    papers: PaperContextService
 
 
 @asynccontextmanager
@@ -38,6 +42,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[AppContext]:
     service = PaperImportService()
     worker = PaperImportWorker(repository, service)
     graph = GraphQueryService(GraphStore())
+    papers = PaperContextService(ElasticsearchPaperStore())
     task = asyncio.create_task(worker.run_exclusive(), name="paper-import-worker")
 
     def report_failure(finished: asyncio.Task[None]) -> None:
@@ -46,17 +51,22 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[AppContext]:
 
     task.add_done_callback(report_failure)
     try:
-        yield AppContext(PaperImportBatches(repository, service), graph)
+        yield AppContext(PaperImportBatches(repository, service), graph, papers)
     finally:
         task.cancel()
         try:
             with suppress(asyncio.CancelledError):
                 await task
         finally:
-            await graph.close()
+            try:
+                await graph.close()
+            finally:
+                await papers.close()
 
 
 mcp = MCPServer("research-os-paper-import", lifespan=lifespan)
+mcp.custom_route("/papers/{paper_id}/viewer", methods=["GET"])(paper_viewer)
+mcp.custom_route("/papers/{paper_id}/source.pdf", methods=["GET", "HEAD"])(paper_pdf)
 
 
 @mcp.tool()
@@ -124,6 +134,34 @@ async def browse_task(task_root_id: str, ctx: Context[AppContext]) -> dict[str, 
         )
     except Exception as exc:
         logger.warning("任务浏览失败：task_root_id=%s error=%s", task_root_id, exc)
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool()
+async def get_paper_context(
+    paper_id: str,
+    parse_version: str,
+    ctx: Context[AppContext],
+    chunk_nos: list[int] | None = None,
+    block_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fetch exact ES evidence and full chunk context; no LLM. Supply chunk_nos or block_ids (max 50 each). If both are supplied, blocks must belong to those chunks. Returns chunks with unchanged content/llm_content, selected blocks with text, 1-based page_number, normalized top-left bbox, assets and viewer_url. HTTP links use this MCP server's port; stdio or missing PDFs return null URLs. Does not fall back to another parse_version."""
+    try:
+        request = ctx.request_context.request
+        return await ctx.request_context.lifespan_context.papers.get(
+            paper_id,
+            parse_version,
+            chunk_nos=chunk_nos,
+            block_ids=block_ids,
+            viewer_base_url=str(request.base_url) if request is not None else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "原文定位失败：paper_id=%s parse_version=%s error=%s",
+            paper_id,
+            parse_version,
+            exc,
+        )
         raise ToolError(str(exc)) from exc
 
 

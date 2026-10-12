@@ -47,6 +47,14 @@ def paper_source_path(paper_id: str) -> Path:
     return paper_dir(paper_id) / "source.pdf"
 
 
+def stored_paper_source_path(paper_id: str) -> Path | None:
+    """只允许读取论文存储目录内的 PDF，包含对符号链接的边界检查。"""
+    source = paper_source_path(paper_id).resolve()
+    if not source.is_relative_to(PAPERS_DIR.resolve()):
+        raise ValueError("PDF is outside the paper storage directory")
+    return source if source.is_file() else None
+
+
 def paper_mineru_dir(paper_id: str, mineru_version: str) -> Path:
     return paper_dir(paper_id) / "mineru" / _path_part(mineru_version)
 

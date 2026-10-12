@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF 原文定位</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: light-dark(#eef1f5, #1d2025); color: light-dark(#182334, #e5e9ef); }
+    header { padding: 16px 24px; background: light-dark(#fff, #292e36); }
+    h1 { font-size: 18px; margin: 0 0 12px; font-weight: 600; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+    button, a { font: inherit; color: inherit; }
+    button { padding: 6px 12px; border: 1px solid light-dark(#bcc5d0, #677384); border-radius: 6px; background: transparent; cursor: pointer; }
+    main { margin: 24px auto; width: min(100% - 32px, 1000px); }
+    #page { position: relative; width: 100%; background: white; }
+    canvas { width: 100%; height: auto; display: block; }
+    #highlight { position: absolute; box-sizing: border-box; border: 2px solid #d78500; background: #ffc94040; pointer-events: none; scroll-margin-top: 100px; }
+    #highlight[hidden] { display: none; }
+    #status { margin-top: 10px; overflow-wrap: anywhere; }
+    #status[data-error] { color: light-dark(#ac1830, #ff95a6); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>PDF 原文定位</h1>
+    <div class="toolbar">
+      <span id="location">加载中…</span>
+      <button id="focus" type="button" disabled>跳到段落</button>
+      <button id="toggle" type="button" aria-pressed="true" disabled>隐藏高亮</button>
+      <a id="original" target="_blank" rel="noopener">打开原始 PDF</a>
+    </div>
+    <div id="status" role="status">正在加载原 PDF…</div>
+  </header>
+  <main>
+    <div id="page">
+      <canvas id="canvas" aria-label="原 PDF 页面"></canvas>
+      <div id="highlight" role="img" aria-label="目标段落 bbox" hidden></div>
+    </div>
+  </main>
+  <script type="module">
+    const params = new URLSearchParams(location.search);
+    const pageNumber = Number(params.get('page_number') || 1);
+    const bboxValue = params.get('bbox');
+    const bbox = bboxValue === null ? null : bboxValue.split(',').map(Number);
+    const blockId = params.get('block_id') || '';
+    const version = params.get('parse_version') || '';
+    const status = document.getElementById('status');
+    const highlight = document.getElementById('highlight');
+    const focusButton = document.getElementById('focus');
+    const toggle = document.getElementById('toggle');
+    const pdfUrl = location.pathname.replace(/\/viewer$/, '/source.pdf');
+    document.getElementById('original').href = `${pdfUrl}#page=${pageNumber}`;
+
+    try {
+      if (!Number.isInteger(pageNumber) || pageNumber < 1) throw new Error('page_number 必须是从 1 开始的整数。');
+      if (bbox !== null && (bbox.length !== 4 || bbox.some(v => !Number.isFinite(v) || v < 0 || v > 1) || bbox[2] <= bbox[0] || bbox[3] <= bbox[1])) {
+        throw new Error('bbox 必须是左上角原点、0–1 归一化的 [x0,y0,x1,y1]。');
+      }
+      const pdfjs = await import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs');
+      pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
+      const pdf = await pdfjs.getDocument(pdfUrl).promise;
+      if (pageNumber > pdf.numPages) throw new Error('页码超出 PDF 页数。');
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1.8 });
+      const canvas = document.getElementById('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      document.getElementById('location').textContent = `第 ${pageNumber} / ${pdf.numPages} 页${blockId ? ' · ' + blockId : ''}`;
+      status.textContent = `${version ? version + ' · ' : ''}${bbox ? '原文已定位并高亮' : '原文已定位到页面（该 block 无 bbox）'}`;
+      if (bbox) {
+        Object.assign(highlight.style, {
+          left: `${bbox[0] * 100}%`, top: `${bbox[1] * 100}%`,
+          width: `${(bbox[2] - bbox[0]) * 100}%`, height: `${(bbox[3] - bbox[1]) * 100}%`
+        });
+        highlight.hidden = false;
+        const focus = () => highlight.scrollIntoView({ block: 'center' });
+        focusButton.disabled = toggle.disabled = false;
+        focusButton.addEventListener('click', focus);
+        toggle.addEventListener('click', () => {
+          highlight.hidden = !highlight.hidden;
+          toggle.textContent = highlight.hidden ? '显示高亮' : '隐藏高亮';
+          toggle.setAttribute('aria-pressed', String(!highlight.hidden));
+        });
+        focus();
+      }
+    } catch (error) {
+      highlight.hidden = true;
+      status.dataset.error = 'true';
+      status.textContent = '加载失败：' + error.message;
+    }
+  </script>
+</body>
+</html>

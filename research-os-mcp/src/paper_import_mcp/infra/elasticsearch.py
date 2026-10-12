@@ -198,6 +198,8 @@ class ElasticsearchPaperStore:
         *,
         paper_id: str,
         parse_version: str,
+        chunk_nos: list[int] | None = None,
+        page_indices: list[int] | None = None,
         page_size: int = 100,
         keep_alive: str = "5m",
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -209,6 +211,9 @@ class ElasticsearchPaperStore:
 
         读取完毕、查询异常或调用生成器的 ``aclose()`` 时释放 PIT。提前结束
         迭代时，调用方应使用 ``contextlib.aclosing`` 或显式 ``await aclose()``。
+
+        可按 chunk 编号或经过指定 page_idx 的 chunk 筛选；省略时读取全文。
+        source_blocks 未索引，按 block 定位时先用页范围召回，再由服务核对。
         """
 
         if not paper_id.strip():
@@ -219,6 +224,32 @@ class ElasticsearchPaperStore:
             raise ValueError("page_size must be between 1 and 10000")
         if not keep_alive.strip():
             raise ValueError("keep_alive must not be blank")
+
+        filters: list[dict[str, Any]] = [
+            {"term": {"paper_id": paper_id}},
+            {"term": {"parse_version": parse_version}},
+        ]
+        if chunk_nos is not None:
+            filters.append({"terms": {"chunk_no": chunk_nos}})
+        if page_indices is not None:
+            filters.append(
+                {
+                    "bool": {
+                        "should": [
+                            {
+                                "bool": {
+                                    "filter": [
+                                        {"range": {"page_start": {"lte": page}}},
+                                        {"range": {"page_end": {"gte": page}}},
+                                    ]
+                                }
+                            }
+                            for page in sorted(set(page_indices))
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
 
         opened = _response_body(
             await self._client.open_point_in_time(
@@ -234,14 +265,7 @@ class ElasticsearchPaperStore:
                 options: dict[str, Any] = {
                     "size": page_size,
                     "pit": {"id": pit_id, "keep_alive": keep_alive},
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {"term": {"paper_id": paper_id}},
-                                {"term": {"parse_version": parse_version}},
-                            ]
-                        }
-                    },
+                    "query": {"bool": {"filter": filters}},
                     "sort": [{"chunk_no": "asc"}, {"_shard_doc": "asc"}],
                     "track_total_hits": False,
                     "allow_partial_search_results": False,
