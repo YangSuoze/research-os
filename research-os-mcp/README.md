@@ -80,6 +80,21 @@ uv run --extra pdf --extra graph python -m paper_import_mcp.server --transport s
 
 ### 原文证据与 PDF 定位
 
+示例使用 Prompt（将 `XX` 和 `XXX` 替换为任务名称和实际 ID）：
+
+```text
+请使用 paper2graph MCP 对应的工具，找到解决 XX 任务的高频使用方法，并提供对应的 PDF 原文链接，让我点击即可查看。
+task_root_id 为 XXX（例如：medical_report_generation）。
+
+1. 使用 browse_task 查看该任务的方法分类，再使用 search_graph 找出使用频次最高的 5 个 MethodLeaf。
+   频次按已导入该任务、实际采用该方法的去重论文数统计；同篇论文的多条 Claim 只计一次，不把 Related Work 中提到的方法算作采用。
+2. 为每个方法查找代表论文及其 mechanism Claim 的 Evidence，获取 paper_id、parse_version、chunk_no 和 block_ids。
+3. 使用 get_paper_context 读取原文，核对方法机制，并取回对应 block 的 viewer_url。
+
+请用表格展示：方法名称、机制摘要、使用论文数、代表论文、原文摘录、可点击的“查看 PDF 原文”链接。
+链接必须使用工具返回的 viewer_url，原文摘录必须来自返回文本；证据或链接缺失时明确说明，不要编造。
+```
+
 从图谱 Evidence 得到定位信息后调用：
 
 ```json
