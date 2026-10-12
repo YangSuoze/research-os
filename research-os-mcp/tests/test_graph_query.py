@@ -12,12 +12,17 @@ from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from mcp import Client
-from pydantic import ValidationError
-
 from paper_import_mcp import paths
-from paper_import_mcp.infra.neo4j import GRAPH_SCHEMA, GraphStore
+from paper_import_mcp.infra.neo4j import (
+    GRAPH_QUERY_RULES,
+    GRAPH_SCHEMA,
+    MAX_QUERY_ROWS,
+    QUERY_TIMEOUT_SECONDS,
+    GraphStore,
+)
 from paper_import_mcp.server import mcp
 from paper_import_mcp.services.graph_query import GraphQueryService
+from pydantic import ValidationError
 
 
 class _Result:
@@ -64,11 +69,105 @@ class GraphQueryServiceTest(unittest.IsolatedAsyncioTestCase):
         )
         request = llm.aquery.call_args
         self.assertIn(GRAPH_SCHEMA, request.args[0][0]["content"])
+        self.assertIn(GRAPH_QUERY_RULES, request.args[0][0]["content"])
         self.assertEqual(
             json.loads(request.args[0][1]["content"])["question"], "查找对比学习方法"
         )
         self.assertEqual(set(request.kwargs["json_mode"].model_fields), {"cypher"})
         self.assertEqual(request.kwargs["temperature"], 0.0)
+
+    def test_schema_uses_shared_definition_and_limits_without_io(self):
+        store = SimpleNamespace(execute_read_query=AsyncMock())
+        with patch("paper_import_mcp.services.graph_query.LLMClient") as factory:
+            schema = GraphQueryService(store).get_schema()
+            self.assertEqual(schema["schema"], GRAPH_SCHEMA)
+            self.assertEqual(
+                schema["query_rules"],
+                {
+                    "read_only": True,
+                    "max_rows": MAX_QUERY_ROWS,
+                    "timeout_seconds": QUERY_TIMEOUT_SECONDS,
+                    "constraints": GRAPH_QUERY_RULES,
+                },
+            )
+            factory.assert_not_called()
+        store.execute_read_query.assert_not_awaited()
+
+    async def test_direct_cypher_preserves_parameters_without_llm(self):
+        cypher = "MATCH (p:Paper)-[:FOR_TASK]->(:TaskRoot {id: $task}) RETURN p.id AS paper_id"
+        parameters = {"task": "medical_reports", "limit": 9999}
+        store = SimpleNamespace(
+            execute_read_query=AsyncMock(return_value=[{"paper_id": "p1"}])
+        )
+        with patch("paper_import_mcp.services.graph_query.LLMClient") as factory:
+            result = await GraphQueryService(store).search(
+                cypher=cypher, parameters=parameters, limit=3
+            )
+            factory.assert_not_called()
+        self.assertEqual(result, {"cypher": cypher, "records": [{"paper_id": "p1"}]})
+        store.execute_read_query.assert_awaited_once_with(cypher, parameters, limit=3)
+        self.assertEqual(parameters, {"task": "medical_reports", "limit": 9999})
+
+    async def test_direct_cypher_without_parameters_uses_empty_mapping(self):
+        store = SimpleNamespace(execute_read_query=AsyncMock(return_value=[]))
+        llm = SimpleNamespace(aquery=AsyncMock())
+        result = await GraphQueryService(store, llm).search(cypher="RETURN 1 AS value")
+        self.assertEqual(result["records"], [])
+        store.execute_read_query.assert_awaited_once_with(
+            "RETURN 1 AS value", {}, limit=50
+        )
+        llm.aquery.assert_not_awaited()
+
+    async def test_ambiguous_modes_and_mode_specific_arguments_fail_before_io(self):
+        store = SimpleNamespace(execute_read_query=AsyncMock())
+        llm = SimpleNamespace(aquery=AsyncMock())
+        service = GraphQueryService(store, llm)
+        for options in [
+            {},
+            {"query": "methods", "cypher": "RETURN 1 AS value"},
+            {"cypher": " "},
+            {"query": "methods", "parameters": {}},
+            {"cypher": "RETURN 1 AS value", "task_root_id": "t1"},
+            {"cypher": "RETURN 1 AS value", "limit": 0},
+            {"cypher": "RETURN 1 AS value", "limit": 101},
+        ]:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await service.search(**options)
+        store.execute_read_query.assert_not_awaited()
+        llm.aquery.assert_not_awaited()
+
+    async def test_direct_cypher_uses_existing_read_only_guard_and_outer_limit(self):
+        store, session, _ = _store([{"value": "x"}])
+        result = await GraphQueryService(store).search(
+            cypher="RETURN $value AS value",
+            parameters={"value": "x", "__result_limit": 99999},
+            limit=1,
+        )
+        self.assertEqual(result["records"], [{"value": "x"}])
+        self.assertTrue(
+            session.run.await_args_list[0].args[0].text.startswith("EXPLAIN ")
+        )
+        self.assertEqual(
+            session.run.await_args.args[1], {"value": "x", "__result_limit": 1}
+        )
+
+    async def test_unsafe_direct_cypher_is_rejected_without_llm(self):
+        for query, query_type in [
+            ("CALL db.labels() YIELD label RETURN label", "r"),
+            ("CREATE (:Paper {id: 'unsafe'})", "w"),
+            ("MATCH (p:Paper) SET p.title = 'changed' RETURN p.id AS id", "rw"),
+        ]:
+            with self.subTest(query=query):
+                store, session, _ = _store(query_type=query_type)
+                with patch(
+                    "paper_import_mcp.services.graph_query.LLMClient"
+                ) as factory:
+                    with self.assertRaises(ValueError):
+                        await GraphQueryService(store).search(cypher=query)
+                    factory.assert_not_called()
+                self.assertEqual(
+                    session.run.await_count, 1 if query_type == "rw" else 0
+                )
 
     async def test_invalid_inputs_do_not_call_llm(self):
         llm = SimpleNamespace(aquery=AsyncMock())
@@ -213,6 +312,7 @@ class GraphReadQueryTest(unittest.IsolatedAsyncioTestCase):
 class GraphMCPTest(unittest.IsolatedAsyncioTestCase):
     async def test_query_tools_are_callable_and_errors_are_reported(self):
         graph = SimpleNamespace(
+            get_schema=Mock(return_value=GraphQueryService.get_schema()),
             search=AsyncMock(
                 return_value={"cypher": "RETURN 1 AS value", "records": [{"value": 1}]}
             ),
@@ -245,7 +345,36 @@ class GraphMCPTest(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(result.is_error, result.content)
                 self.assertEqual(result.structured_content["records"], [{"value": 1}])
-                graph.search.assert_awaited_once_with("find methods", "t1", 5)
+                graph.search.assert_awaited_once_with(
+                    "find methods", "t1", 5, cypher=None, parameters=None
+                )
+                result = await client.call_tool("get_graph_schema", {})
+                self.assertFalse(result.is_error, result.content)
+                self.assertEqual(result.structured_content["schema"], GRAPH_SCHEMA)
+                graph.get_schema.assert_called_once_with()
+                result = await client.call_tool(
+                    "search_graph",
+                    {
+                        "cypher": "RETURN $value AS value",
+                        "parameters": {"value": 1},
+                        "limit": 2,
+                    },
+                )
+                self.assertFalse(result.is_error, result.content)
+                graph.search.assert_awaited_with(
+                    None,
+                    None,
+                    2,
+                    cypher="RETURN $value AS value",
+                    parameters={"value": 1},
+                )
+                graph.search.side_effect = ValueError(
+                    "Provide exactly one of query or cypher"
+                )
+                result = await client.call_tool(
+                    "search_graph", {"query": "methods", "cypher": "RETURN 1 AS value"}
+                )
+                self.assertTrue(result.is_error)
                 result = await client.call_tool("browse_task", {"task_root_id": "t1"})
                 self.assertFalse(result.is_error, result.content)
                 self.assertEqual(result.structured_content["task"]["id"], "t1")
@@ -265,7 +394,6 @@ class GraphMCPTest(unittest.IsolatedAsyncioTestCase):
 class GraphQueryNeo4jTest(unittest.IsolatedAsyncioTestCase):
     async def test_shared_entities_do_not_leak_into_other_tasks(self):
         from neo4j import AsyncGraphDatabase
-
         from paper_import_mcp.config import settings
 
         prefix = "query_test_" + uuid4().hex

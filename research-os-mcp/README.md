@@ -34,8 +34,10 @@ uv run --extra pdf --extra graph python -m paper_import_mcp.server --transport s
 | `create_paper_import_batch` | `task_root_id`，以及 `pdf_paths` 或 `paper_ids` | 保存 PDF 并入队，立即返回 `batch_id` |
 | `get_paper_import_batch` | `batch_id` | 查询批次和逐篇阶段／状态／错误 |
 | `retry_failed_paper_import_batch` | `batch_id` | 只重试失败论文 |
-| `search_graph` | `query`，可选 `task_root_id`、`limit`（默认 50，范围 1–100） | 自然语言转只读 Cypher，返回 `cypher` 和 `records` |
+| `get_graph_schema` | 无 | 返回应用约定的图节点、属性、关系方向和只读查询规则，不扫描数据库 |
+| `search_graph` | `query` 或 `cypher` 二选一；可选 `parameters`、`task_root_id`、`limit`（默认 50，范围 1–100） | 自然语言转 Cypher 或直接执行只读 Cypher，返回 `cypher` 和 `records` |
 | `browse_task` | `task_root_id` | 返回任务的方法类别、方法摘要、相关问题和数据集，不调用 LLM |
+| `search_paper_chunks` | `query`，可选 `paper_ids`、`limit`（默认 10，范围 1–100） | BM25 搜索 ES 正文，返回预览和含 `parse_version` 的定位信息，不接收版本参数 |
 | `get_paper_context` | `paper_id`、`parse_version`，以及 `chunk_nos` 或 `block_ids`（各最多 50 个） | 精确取回 ES 原文、chunk 上下文、页码／bbox 和 PDF 定位链接，不调用 LLM |
 
 `pdf_paths` 是 **MCP 服务所在机器上的绝对或相对路径**，不是远程客户端电脑的路径。
@@ -70,13 +72,53 @@ uv run --extra pdf --extra graph python -m paper_import_mcp.server --transport s
 再使用 search_graph，查找该任务中使用对比学习的方法及相关局限，并返回论文和证据定位。
 ```
 
-`search_graph` 使用 Text2Cypher，而非向量相似度检索。提供 `task_root_id` 时，
-模型会被要求通过该任务论文的 Claim 筛选知识；生成的 Cypher 随结果返回，便于核验。
-执行前通过 `EXPLAIN` 检查只读查询类型，禁止过程调用、外部数据加载和多语句，
-并设置 10 秒数据库超时及服务端结果行数上限。
+`search_graph` 支持两种互斥模式：
+
+- `query`：自然语言通过 LLM 转成 Cypher，不是向量相似度检索。
+  可用 `task_root_id` 提示模型通过该任务论文的 Claim 筛选知识。
+- `cypher`：直接执行调用方的查询，不调用 LLM；变量通过 `parameters` 传入。
+  不接收独立的 `task_root_id`，也不自动改写任务过滤条件或注入参数。
+
+自行编写查询前可调用 `get_graph_schema`，它与模型提示词共用同一份图结构和
+查询规则，返回的是应用约定，不是数据库实时扫描结果。直接查询示例：
+
+```json
+{
+  "cypher": "MATCH (paper:Paper)-[:FOR_TASK]->(:TaskRoot {id: $task}) RETURN paper.id AS paper_id, paper.title AS title",
+  "parameters": {"task": "medical_report_generation"},
+  "limit": 10
+}
+```
+
+两种模式都返回 `cypher` 和 `records`，并共用 `EXPLAIN` 只读检查、10 秒数据库
+超时和外层结果行数限制。禁止 `CALL`（包括子查询）、外部数据加载和多语句；
+`__result_limit` 是服务端保留参数，调用方不能覆盖外层行数上限。
 
 `browse_task` 使用固定查询，只收录该任务论文实际关联的方法、问题和数据集，
 不通过共享 Family 直接判断任务归属。不存在的任务返回错误，不会创建节点。
+
+### 论文正文搜索
+
+`search_paper_chunks` 搜索已导入论文的标题、章节和正文，使用 BM25，不调用 LLM，
+不做向量化。示例：
+
+```json
+{
+  "query": "contrastive learning",
+  "paper_ids": ["paper_..."],
+  "limit": 5
+}
+```
+
+省略 `paper_ids` 时搜索全部论文，传空列表时不匹配任何论文。限定任务时，先
+通过 `search_graph` 获取该任务论文的 `paper_id`，再传入 `paper_ids`；ES 不存
+`task_root_id`，搜索工具也不隐式联查 Neo4j。
+
+返回 `hits`，每条包含 `paper_id`、`parse_version`、`chunk_no`、`paper_title`、
+`section_path`、`content_type`、`score` 和 `content_preview`。**不接收
+`parse_version` 输入参数**，不同版本的命中保留各自身份，不自动合并或切换到
+最新版本。预览用于发现相关内容，不用于精确引用；将命中的论文 ID、解析版本和
+chunk 编号传给 `get_paper_context`，再获取完整原文、block 标识及 PDF 定位链接。
 
 ### 原文证据与 PDF 定位
 

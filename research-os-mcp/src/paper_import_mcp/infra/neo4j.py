@@ -66,7 +66,17 @@ Do not return embeddings, raw nodes, relationships or paths; project explicit pr
 """
 
 MAX_QUERY_ROWS = 100
-_QUERY_TIMEOUT = 10
+QUERY_TIMEOUT_SECONDS = 10
+GRAPH_QUERY_RULES = """Submit one read-only Cypher statement. Start with MATCH,
+OPTIONAL MATCH, WITH, UNWIND or RETURN. Do not use CALL (including subqueries),
+LOAD CSV, USE, SHOW, write/schema/administration commands, comments, semicolons
+or EXPLAIN/PROFILE/CYPHER directives. Project named properties, not raw nodes,
+relationships, paths or embeddings. The server checks the EXPLAIN query type
+and enforces an outer result row limit and a database timeout.
+Direct Cypher is not rewritten and does not call an LLM. Supply its parameters
+explicitly; the server reserves __result_limit. Direct task filtering must be
+written into Cypher using paper provenance, not inferred from shared taxonomy.
+"""
 _CYPHER_LITERALS = re.compile(
     r"""'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:``|[^`])*`""", re.DOTALL
 )
@@ -122,7 +132,7 @@ class GraphStore:
     async def execute_read_query(
         self, cypher: str, parameters: dict | None = None, *, limit: int = 50
     ) -> list[dict]:
-        """执行模型生成的单条只读 Cypher；查询类型由 Neo4j 编译器确认。"""
+        """执行模型或调用方提供的单条只读 Cypher；由 Neo4j 编译器核对类型。"""
         cypher = cypher.strip()
         visible = _CYPHER_LITERALS.sub(" ", cypher)
         if not re.match(
@@ -160,17 +170,18 @@ class GraphStore:
     async def _read_query(self, cypher: str, parameters: dict) -> list[dict]:
         from neo4j import READ_ACCESS, Query
 
-        async with asyncio.timeout(_QUERY_TIMEOUT + 5):
+        async with asyncio.timeout(QUERY_TIMEOUT_SECONDS + 5):
             async with self._driver.session(default_access_mode=READ_ACCESS) as session:
                 plan = await session.run(
-                    Query("EXPLAIN " + cypher, timeout=_QUERY_TIMEOUT), parameters
+                    Query("EXPLAIN " + cypher, timeout=QUERY_TIMEOUT_SECONDS),
+                    parameters,
                 )
                 summary = await plan.consume()
                 # READ_ACCESS 只负责路由，不能替代执行前的只读检查。
                 if summary.query_type != "r":
                     raise ValueError("Only read-only Cypher is allowed")
                 result = await session.run(
-                    Query(cypher, timeout=_QUERY_TIMEOUT), parameters
+                    Query(cypher, timeout=QUERY_TIMEOUT_SECONDS), parameters
                 )
                 records = [record.data() async for record in result]
         # 时间等 Neo4j 特有值转为字符串，保证 MCP 返回标准 JSON。

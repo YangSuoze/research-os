@@ -110,18 +110,43 @@ async def retry_failed_paper_import_batch(
 
 @mcp.tool()
 async def search_graph(
-    query: str,
     ctx: Context[AppContext],
+    query: str | None = None,
+    cypher: str | None = None,
+    parameters: dict[str, Any] | None = None,
     task_root_id: str | None = None,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """Translate a research question to read-only Cypher and return cypher/records. Optional task_root_id guides paper-level task filtering. limit: 1-100."""
+    """Return cypher/records from exactly one of query (natural language via LLM) or cypher (direct, no LLM). Natural language supports task_root_id. Direct Cypher supports parameters; write task filtering explicitly in Cypher instead of passing task_root_id. Both modes enforce read-only execution, timeout and limit (1-100, default 50)."""
     try:
         return await ctx.request_context.lifespan_context.graph.search(
-            query, task_root_id, limit
+            query, task_root_id, limit, cypher=cypher, parameters=parameters
         )
     except Exception as exc:
         logger.warning("图谱检索失败：%s", exc)
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool()
+async def get_graph_schema(ctx: Context[AppContext]) -> dict[str, Any]:
+    """Return application graph labels, properties, directed relationships, provenance rules and read-query limits. Same schema as the Text2Cypher prompt; no LLM or database scan. Read this before writing direct Cypher."""
+    return ctx.request_context.lifespan_context.graph.get_schema()
+
+
+@mcp.tool()
+async def search_paper_chunks(
+    query: str,
+    ctx: Context[AppContext],
+    paper_ids: list[str] | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Search ES paper chunks with BM25; no LLM or vector search. Optional paper_ids restricts papers (empty list matches none), limit: 1-100. Returns hits with score, paper_id, parse_version, chunk_no, title, section and content_preview. Does not accept parse_version. For exact text, blocks and PDF links, pass a hit's paper_id/parse_version/chunk_no to get_paper_context; previews are not citation locators. For task scope, first retrieve paper IDs through search_graph."""
+    try:
+        return await ctx.request_context.lifespan_context.papers.search(
+            query, paper_ids=paper_ids, limit=limit
+        )
+    except Exception as exc:
+        logger.warning("论文正文检索失败：query=%r error=%s", query, exc)
         raise ToolError(str(exc)) from exc
 
 

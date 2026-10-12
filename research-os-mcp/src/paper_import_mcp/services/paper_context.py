@@ -20,6 +20,35 @@ class PaperContextService:
     def __init__(self, store: ElasticsearchPaperStore) -> None:
         self.store = store
 
+    async def search(
+        self,
+        query: str,
+        *,
+        paper_ids: list[str] | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """只做 BM25 召回；结果保留解析版本，完整原文及 PDF 定位由 get 提供。"""
+        hits = await self.store.search_bm25(
+            query.strip(), paper_ids=paper_ids, size=limit
+        )
+        results = [
+            {
+                "paper_id": hit.source["paper_id"],
+                "parse_version": hit.source["parse_version"],
+                "chunk_no": hit.source["chunk_no"],
+                "paper_title": hit.source["paper_title"],
+                "section_path": hit.source["section_path"],
+                "content_type": hit.source["content_type"],
+                "score": hit.score,
+                "content_preview": "\n...\n".join(
+                    hit.highlights.get("content") or [hit.source["content"][:500]]
+                ),
+            }
+            for hit in hits
+        ]
+        logger.info("论文正文检索：query=%r hits=%d", query, len(results))
+        return {"hits": results}
+
     async def get(
         self,
         paper_id: str,

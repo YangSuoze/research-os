@@ -47,6 +47,8 @@ class PaperImportMCPTest(unittest.IsolatedAsyncioTestCase):
                 "search_graph",
                 "browse_task",
                 "get_paper_context",
+                "get_graph_schema",
+                "search_paper_chunks",
             },
         )
         created = await client.call_tool(

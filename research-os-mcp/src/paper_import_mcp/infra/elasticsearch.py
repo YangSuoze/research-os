@@ -298,7 +298,7 @@ class ElasticsearchPaperStore:
         self,
         query: str,
         *,
-        paper_id: str | None = None,
+        paper_ids: list[str] | None = None,
         size: int = 10,
     ) -> list[Bm25Hit]:
         """使用 Elasticsearch 默认 BM25 对论文 chunk 做关键词检索。"""
@@ -309,8 +309,13 @@ class ElasticsearchPaperStore:
             raise ValueError("size must be between 1 and 100")
 
         filters: list[dict[str, Any]] = []
-        if paper_id is not None:
-            filters.append({"term": {"paper_id": paper_id}})
+        if paper_ids is not None:
+            paper_ids = list(dict.fromkeys(paper_id.strip() for paper_id in paper_ids))
+            if any(not paper_id for paper_id in paper_ids):
+                raise ValueError("paper_ids must not contain blank IDs")
+            if not paper_ids:
+                return []
+            filters.append({"terms": {"paper_id": paper_ids}})
 
         response = await self._client.search(
             index=self.index_name,
@@ -334,12 +339,17 @@ class ElasticsearchPaperStore:
                 }
             },
             highlight={
+                "pre_tags": [""],
+                "post_tags": [""],
                 "fields": {
                     "content": {"fragment_size": 180, "number_of_fragments": 2},
-                }
+                },
             },
+            allow_partial_search_results=False,
         )
         payload = _response_body(response)
+        if payload.get("timed_out") or payload.get("_shards", {}).get("failed", 0):
+            raise ElasticsearchIndexError("Elasticsearch BM25 search did not complete")
         return [
             Bm25Hit(
                 document_id=hit["_id"],
