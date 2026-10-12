@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from uuid import uuid4
 
 from paper_import_mcp.config import settings
@@ -30,6 +33,70 @@ RELATION_TYPES = frozenset(
 )
 VECTOR_INDEXES = {label: f"{label.lower()}_embedding" for label in ALIGNED_LABELS}
 
+GRAPH_SCHEMA = """Nodes (all have a unique string id):
+TaskRoot: id, name, definition, method_guidelines
+MethodFamily: id, name, definition, aliases
+MethodLeaf: id, name, mechanism, aliases
+Problem: id, name, description, aliases
+Dataset: id, name, description, aliases
+Paper: id (the paper_id), title, code_link
+Claim: id, kind (mechanism/addresses/result/limitation), text, paper_id,
+       parse_version, name (optional limitation name)
+Evidence: id, paper_id, parse_version, chunk_no (integer), block_ids (string array)
+
+Directed relationships:
+TaskRoot -HAS_FAMILY-> MethodFamily -HAS_METHOD-> MethodLeaf
+Paper -FOR_TASK-> TaskRoot
+Paper -HAS_CLAIM-> Claim -ABOUT_METHOD-> MethodLeaf
+Claim -ABOUT_PROBLEM-> Problem
+Claim -ON_DATASET-> Dataset
+MethodLeaf -ADDRESSES-> Problem
+Paper -USES_DATASET-> Dataset -FOR_TASK-> TaskRoot
+Paper -HAS_EVIDENCE-> Evidence -SUPPORTS-> Claim or Dataset
+
+Methods, families, problems and datasets are shared across tasks. A task's actual
+methods come from its Papers' mechanism Claims; its problems come from its Papers'
+addresses Claims; its datasets come from its Papers' USES_DATASET relationships.
+Do not infer task membership solely from HAS_FAMILY/HAS_METHOD, ADDRESSES or
+Dataset.FOR_TASK: these shared relationships can include other papers' knowledge.
+Result and limitation are Claim kinds, NOT separate node labels. Claims with no
+ABOUT_METHOD are paper-level findings; do not attribute them to a particular method.
+Evidence locates original ES chunks by paper_id, parse_version, chunk_no and block_ids.
+Do not return embeddings, raw nodes, relationships or paths; project explicit properties.
+"""
+
+MAX_QUERY_ROWS = 100
+_QUERY_TIMEOUT = 10
+_CYPHER_LITERALS = re.compile(
+    r"""'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:``|[^`])*`""", re.DOTALL
+)
+
+_TASK_BROWSE_QUERY = """
+MATCH (task:TaskRoot {id: $task_root_id})
+CALL (task) {
+    MATCH (paper:Paper)-[:FOR_TASK]->(task)
+    MATCH (paper)-[:HAS_CLAIM]->(:Claim {kind: 'mechanism'})-[:ABOUT_METHOD]->(method:MethodLeaf)
+    WITH DISTINCT method
+    MATCH (family:MethodFamily)-[:HAS_METHOD]->(method)
+    WITH family, collect(DISTINCT method{.id, .name, .mechanism}) AS methods
+    ORDER BY family.name
+    RETURN collect(family{.id, .name, .definition, methods: methods}) AS families
+}
+CALL (task) {
+    MATCH (paper:Paper)-[:FOR_TASK]->(task)
+    MATCH (paper)-[:HAS_CLAIM]->(:Claim {kind: 'addresses'})-[:ABOUT_PROBLEM]->(problem:Problem)
+    WITH DISTINCT problem ORDER BY problem.name
+    RETURN collect(problem{.id, .name, .description}) AS problems
+}
+CALL (task) {
+    MATCH (paper:Paper)-[:FOR_TASK]->(task)
+    MATCH (paper)-[:USES_DATASET]->(dataset:Dataset)
+    WITH DISTINCT dataset ORDER BY dataset.name
+    RETURN collect(dataset{.id, .name, .description}) AS datasets
+}
+RETURN task{.id, .name, .definition} AS task, families, problems, datasets
+"""
+
 
 class GraphStore:
     def __init__(
@@ -51,6 +118,63 @@ class GraphStore:
 
     async def verify(self) -> None:
         await self._driver.verify_connectivity()
+
+    async def execute_read_query(
+        self, cypher: str, parameters: dict | None = None, *, limit: int = 50
+    ) -> list[dict]:
+        """执行模型生成的单条只读 Cypher；查询类型由 Neo4j 编译器确认。"""
+        cypher = cypher.strip()
+        visible = _CYPHER_LITERALS.sub(" ", cypher)
+        if not re.match(
+            r"^\s*(MATCH|OPTIONAL\s+MATCH|WITH|UNWIND|RETURN)\b", visible, re.IGNORECASE
+        ):
+            raise ValueError("Cypher must start with a read query clause")
+        if re.search(
+            r"\b(CALL|LOAD|USE|SHOW|PROFILE|EXPLAIN|CYPHER)\b|;|//|/\*",
+            visible,
+            re.IGNORECASE,
+        ):
+            raise ValueError(
+                "Procedure calls, external loading, comments and multiple statements are not allowed"
+            )
+        if not 1 <= limit <= MAX_QUERY_ROWS:
+            raise ValueError(f"limit must be between 1 and {MAX_QUERY_ROWS}")
+        # 外层 LIMIT 不依赖模型是否正确添加 LIMIT，也覆盖 UNION 查询的总行数。
+        bounded = f"CALL () {{\n{cypher}\n}}\nRETURN * LIMIT $__result_limit"
+        return await self._read_query(
+            bounded, {**(parameters or {}), "__result_limit": limit}
+        )
+
+    async def browse_task(self, task_root_id: str) -> dict:
+        """仅依据该任务实际论文的 Claim/USES_DATASET 组织知识，不调用模型。"""
+        task_root_id = task_root_id.strip()
+        if not task_root_id:
+            raise ValueError("task_root_id must not be blank")
+        records = await self._read_query(
+            _TASK_BROWSE_QUERY, {"task_root_id": task_root_id}
+        )
+        if not records:
+            raise ValueError(f"TaskRoot {task_root_id!r} does not exist")
+        return records[0]
+
+    async def _read_query(self, cypher: str, parameters: dict) -> list[dict]:
+        from neo4j import READ_ACCESS, Query
+
+        async with asyncio.timeout(_QUERY_TIMEOUT + 5):
+            async with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                plan = await session.run(
+                    Query("EXPLAIN " + cypher, timeout=_QUERY_TIMEOUT), parameters
+                )
+                summary = await plan.consume()
+                # READ_ACCESS 只负责路由，不能替代执行前的只读检查。
+                if summary.query_type != "r":
+                    raise ValueError("Only read-only Cypher is allowed")
+                result = await session.run(
+                    Query(cypher, timeout=_QUERY_TIMEOUT), parameters
+                )
+                records = [record.data() async for record in result]
+        # 时间等 Neo4j 特有值转为字符串，保证 MCP 返回标准 JSON。
+        return json.loads(json.dumps(records, ensure_ascii=False, default=str))
 
     async def initialize_schema(self) -> None:
         async with self._driver.session() as session:

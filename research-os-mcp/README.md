@@ -34,6 +34,8 @@ uv run --extra pdf --extra graph python -m paper_import_mcp.server --transport s
 | `create_paper_import_batch` | `task_root_id`，以及 `pdf_paths` 或 `paper_ids` | 保存 PDF 并入队，立即返回 `batch_id` |
 | `get_paper_import_batch` | `batch_id` | 查询批次和逐篇阶段／状态／错误 |
 | `retry_failed_paper_import_batch` | `batch_id` | 只重试失败论文 |
+| `search_graph` | `query`，可选 `task_root_id`、`limit`（默认 50，范围 1–100） | 自然语言转只读 Cypher，返回 `cypher` 和 `records` |
+| `browse_task` | `task_root_id` | 返回任务的方法类别、方法摘要、相关问题和数据集，不调用 LLM |
 
 `pdf_paths` 是 **MCP 服务所在机器上的绝对或相对路径**，不是远程客户端电脑的路径。
 `paper_ids` 指已有的 `data/workspace/papers/<paper_id>/source.pdf`。
@@ -59,3 +61,30 @@ uv run --extra pdf --extra graph python -m paper_import_mcp.server --transport s
 智能体应先枚举文件，将具体路径通过 `pdf_paths` 提交给 `create_paper_import_batch`，
 再使用 `get_paper_import_batch` 持续查询并汇报进度。收到 `batch_id` 只表示入队，
 不代表导入完成；应等所有论文进入成功或失败的终态后汇总结果。
+
+### 图谱查询
+
+```text
+请使用 paper2graph MCP 的 browse_task，查看 medical_report_generation 任务的方法类别、方法摘要、相关问题和数据集。
+再使用 search_graph，查找该任务中使用对比学习的方法及相关局限，并返回论文和证据定位。
+```
+
+`search_graph` 使用 Text2Cypher，而非向量相似度检索。提供 `task_root_id` 时，
+模型会被要求通过该任务论文的 Claim 筛选知识；生成的 Cypher 随结果返回，便于核验。
+执行前通过 `EXPLAIN` 检查只读查询类型，禁止过程调用、外部数据加载和多语句，
+并设置 10 秒数据库超时及服务端结果行数上限。
+
+`browse_task` 使用固定查询，只收录该任务论文实际关联的方法、问题和数据集，
+不通过共享 Family 直接判断任务归属。不存在的任务返回错误，不会创建节点。
+
+### 测试
+
+```bash
+.venv/bin/python -m unittest discover -s tests -q
+```
+
+可选的真实 Neo4j 测试使用事务内临时夹具，完成后回滚，不保留测试节点：
+
+```bash
+PAPER_GRAPH_QUERY_TEST_NEO4J=1 .venv/bin/python -m unittest discover -s tests -p test_graph_query.py -v
+```
