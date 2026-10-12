@@ -1,0 +1,9 @@
+interface:
+  display_name: "Graph Explore"
+  short_description: "Explore paper2graph relationships and evidence"
+  default_prompt: "Use $graph-explore with paper2graph MCP to investigate <question>, follow relevant relationships, and cite original paper evidence where needed."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "paper2graph"
+      description: "Read research graph relationships, statistics and original paper evidence"

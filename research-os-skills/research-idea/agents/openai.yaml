@@ -1,0 +1,9 @@
+interface:
+  display_name: "Research Idea"
+  short_description: "Ground algorithm ideas in paper2graph evidence"
+  default_prompt: "Use $research-idea with paper2graph MCP to propose evidence-backed algorithmic research ideas and minimal experiments."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "paper2graph"
+      description: "Research OS graph queries and original paper evidence"
